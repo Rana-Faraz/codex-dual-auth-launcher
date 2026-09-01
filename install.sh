@@ -2,14 +2,14 @@
 set -euo pipefail
 
 REPOSITORY="${CODEX_DUAL_AUTH_REPO:-Rana-Faraz/codex-dual-auth-launcher}"
-VERSION="${CODEX_DUAL_AUTH_VERSION:-v0.1.0}"
+VERSION="${CODEX_DUAL_AUTH_VERSION:-v0.1.1}"
 ASSET="Codex-Dual-Auth-macOS-arm64.zip"
-EXPECTED_SHA256="70285344b6d782668c3994141220e4b1ff47b0d0479a24da3c9715ffc4d2b7e0"
+EXPECTED_SHA256="a80a8108333345c3a1460e8730febdbd75a277f36f3782cbacb2c1ac9121eb58"
 INSTALL_DIR="${CODEX_DUAL_AUTH_INSTALL_DIR:-$HOME/Applications}"
 DESTINATION="$INSTALL_DIR/Codex Dual Auth.app"
 
 if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
-  print -u2 "Codex Dual Auth v0.1.0 supports Apple-silicon macOS only."
+  print -u2 "Codex Dual Auth $VERSION supports Apple-silicon macOS only."
   exit 1
 fi
 

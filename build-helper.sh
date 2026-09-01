@@ -28,6 +28,7 @@ mkdir -p "$APP_ROOT/Contents/MacOS" "$APP_ROOT/Contents/Resources"
 swiftc \
   -parse-as-library \
   -O \
+  -target arm64-apple-macosx14.0 \
   -framework SwiftUI \
   -framework AppKit \
   "$SCRIPT_DIR/Sources/CodexDualAuthLauncher.swift" \
@@ -37,6 +38,7 @@ cp "$CODEX_SOURCE/codex-rs/target/release/codex" "$APP_ROOT/Contents/Resources/c
 chmod 755 "$APP_ROOT/Contents/MacOS/CodexDualAuthLauncher" "$APP_ROOT/Contents/Resources/codex-dual-auth"
 strip -S -x "$APP_ROOT/Contents/Resources/codex-dual-auth"
 codesign --force --deep --sign - "$APP_ROOT"
+"$SCRIPT_DIR/scripts/verify-bundle.sh" "$APP_ROOT"
 
 rm -f "$OUTPUT_ROOT/Codex-Dual-Auth-macOS-arm64.zip"
 ditto -c -k --sequesterRsrc --keepParent "$APP_ROOT" "$OUTPUT_ROOT/Codex-Dual-Auth-macOS-arm64.zip"

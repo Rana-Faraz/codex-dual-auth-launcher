@@ -12,7 +12,7 @@ Prerequisites: Apple-silicon Mac running macOS 14 or later, with the official Co
 /bin/zsh -c "$(curl -fsSL https://raw.githubusercontent.com/Rana-Faraz/codex-dual-auth-launcher/main/install.sh)"
 ```
 
-The installer downloads the pinned `v0.1.0` release, checks its SHA-256 digest and code signature, installs it to `~/Applications/Codex Dual Auth.app`, and opens it. It does not modify the official Codex app.
+The installer downloads the pinned `v0.1.1` release, checks its SHA-256 digest and code signature, installs it to `~/Applications/Codex Dual Auth.app`, and opens it. It does not modify the official Codex app.
 
 Then:
 
@@ -56,11 +56,12 @@ cd codex-dual-auth-launcher
 
 The script fetches the pinned upstream Codex revision, applies [`patches/codex-dual-auth.patch`](patches/codex-dual-auth.patch), builds the Rust CLI and SwiftUI launcher, strips symbols, ad-hoc signs the app, and writes the result to `dist/`.
 
-## Validation performed for v0.1.0
+## Validation performed for v0.1.1
 
 - `cargo check -p codex-mcp -p codex-core -p codex-app-server`
 - All 215 `codex-mcp` tests through the repository's `just test`/Nextest harness
 - Swift type-check and property-list validation
+- Mach-O deployment-target regression check (`minos 14.0`)
 - Deep strict signature verification on the packaged app
 - A live JSON-RPC `initialize` smoke test with independent account A and account B profiles; the app-server remained healthy and selected the isolated Apps identity
 
