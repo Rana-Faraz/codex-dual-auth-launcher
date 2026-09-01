@@ -1,0 +1,517 @@
+diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
+index 12f82e6..10613d6 100644
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -482,6 +482,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
+                 config_warnings: args.config_warnings,
+                 session_source: args.session_source,
+                 auth_manager,
++                codex_apps_auth: None,
+                 installation_id,
+                 code_mode_session_provider: None,
+                 rpc_transport: AppServerRpcTransport::InProcess,
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 76709f8..95c9fe0 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -6,10 +6,12 @@ use codex_code_mode::CodeModeSessionProvider;
+ use codex_code_mode::GrpcCodeModeSessionProvider;
+ use codex_config::LoaderOverrides;
+ use codex_config::NoopThreadConfigLoader;
++use codex_core::CodexAppsAuthContext;
+ use codex_core::config::Config;
+ use codex_core::config::UnsupportedUntrustedApprovalPolicyError;
+ use codex_core::resolve_installation_id;
+ use codex_login::AuthManager;
++use codex_login::CodexAuth;
+ #[cfg(debug_assertions)]
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_cli::CliConfigOverrides;
+@@ -80,6 +82,53 @@ use tracing_subscriber::registry::Registry;
+ use tracing_subscriber::util::SubscriberInitExt;
+ 
+ const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
++const CODEX_CONNECTORS_HOME_ENV_VAR: &str = "CODEX_CONNECTORS_HOME";
++
++async fn codex_apps_auth_context_from_env(
++    config: &Config,
++) -> std::io::Result<Option<CodexAppsAuthContext>> {
++    let Some(raw_home) = std::env::var_os(CODEX_CONNECTORS_HOME_ENV_VAR) else {
++        return Ok(None);
++    };
++    let codex_home = Path::new(&raw_home);
++    if !codex_home.is_absolute() {
++        return Err(std::io::Error::new(
++            ErrorKind::InvalidInput,
++            format!("{CODEX_CONNECTORS_HOME_ENV_VAR} must be an absolute path"),
++        ));
++    }
++    if codex_home == config.codex_home.as_path() {
++        return Err(std::io::Error::new(
++            ErrorKind::InvalidInput,
++            format!("{CODEX_CONNECTORS_HOME_ENV_VAR} must differ from CODEX_HOME"),
++        ));
++    }
++
++    let mut auth_config = config.auth_config();
++    auth_config.codex_home = codex_home.to_path_buf();
++    let auth_manager =
++        AuthManager::shared_from_auth_config(auth_config, /*enable_codex_api_key_env*/ false)
++            .await
++            .map_err(std::io::Error::other)?;
++    let auth = auth_manager.auth().await;
++    if !auth.as_ref().is_some_and(CodexAuth::uses_codex_backend) {
++        return Err(std::io::Error::new(
++            ErrorKind::PermissionDenied,
++            format!(
++                "{CODEX_CONNECTORS_HOME_ENV_VAR} does not contain a ChatGPT login; run the launch helper's connector-account sign-in first"
++            ),
++        ));
++    }
++
++    info!(
++        connectors_home = %codex_home.display(),
++        "Codex Apps will use an isolated ChatGPT identity"
++    );
++    Ok(Some(CodexAppsAuthContext {
++        codex_home: codex_home.to_path_buf(),
++        auth_manager,
++    }))
++}
+ 
+ fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool {
+     err.get_ref().is_some_and(
+@@ -755,6 +804,7 @@ pub async fn run_main_with_transport_options(
+         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+             .await
+             .map_err(std::io::Error::other)?;
++    let codex_apps_auth = codex_apps_auth_context_from_env(&config).await?;
+ 
+     let remote_control_enabled = remote_control_policy == RemoteControlPolicy::Allowed
+         && remote_control_explicitly_requested
+@@ -917,6 +967,7 @@ pub async fn run_main_with_transport_options(
+             config_warnings,
+             session_source,
+             auth_manager,
++            codex_apps_auth,
+             installation_id,
+             code_mode_session_provider,
+             rpc_transport: analytics_rpc_transport(&transport),
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 8d3e085..f6396e0 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -254,6 +254,7 @@ pub(crate) struct MessageProcessorArgs {
+     pub(crate) config_warnings: Vec<ConfigWarningNotification>,
+     pub(crate) session_source: SessionSource,
+     pub(crate) auth_manager: Arc<AuthManager>,
++    pub(crate) codex_apps_auth: Option<codex_core::CodexAppsAuthContext>,
+     pub(crate) installation_id: String,
+     pub(crate) code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>>,
+     pub(crate) rpc_transport: AppServerRpcTransport,
+@@ -278,6 +279,7 @@ impl MessageProcessor {
+             config_warnings,
+             session_source,
+             auth_manager,
++            codex_apps_auth,
+             installation_id,
+             code_mode_session_provider,
+             rpc_transport,
+@@ -357,6 +359,9 @@ impl MessageProcessor {
+                     thread_state_manager.clone(),
+                 )),
+             );
++            manager
++                .mcp_manager()
++                .set_codex_apps_auth(codex_apps_auth.clone());
+             match code_mode_session_provider {
+                 Some(provider) => manager.with_code_mode_session_provider(provider),
+                 None => manager,
+@@ -404,7 +409,10 @@ impl MessageProcessor {
+             config_manager.clone(),
+         );
+         let apps_processor = AppsRequestProcessor::new(
+-            auth_manager.clone(),
++            codex_apps_auth
++                .as_ref()
++                .map(|context| Arc::clone(&context.auth_manager))
++                .unwrap_or_else(|| auth_manager.clone()),
+             Arc::clone(&thread_manager),
+             outgoing.clone(),
+             config_manager.clone(),
+diff --git a/codex-rs/app-server/src/message_processor_tracing_tests.rs b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+index 842563e..6273483 100644
+--- a/codex-rs/app-server/src/message_processor_tracing_tests.rs
++++ b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+@@ -265,6 +265,7 @@ async fn build_test_processor(
+         config_warnings: Vec::new(),
+         session_source: SessionSource::VSCode,
+         auth_manager,
++        codex_apps_auth: None,
+         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+         code_mode_session_provider: None,
+         rpc_transport: AppServerRpcTransport::Stdio,
+diff --git a/codex-rs/app-server/src/request_processors/apps_processor/installed.rs b/codex-rs/app-server/src/request_processors/apps_processor/installed.rs
+index 8b2ccbc..89563c0 100644
+--- a/codex-rs/app-server/src/request_processors/apps_processor/installed.rs
++++ b/codex-rs/app-server/src/request_processors/apps_processor/installed.rs
+@@ -98,6 +98,11 @@ impl AppsRequestProcessor {
+                         client_mcp_extensions: ClientMcpExtensions::default(),
+                         auth: auth.clone(),
+                         auth_manager: codex_apps_auth_manager,
++                        codex_apps_auth: None,
++                        codex_apps_auth_manager: None,
++                        codex_apps_codex_home: mcp_manager
++                            .codex_apps_auth()
++                            .map(|context| context.codex_home),
+                         elicitation_reviewer: None,
+                         elicitation_lifecycle: None,
+                     })
+diff --git a/codex-rs/codex-mcp/src/connection_manager.rs b/codex-rs/codex-mcp/src/connection_manager.rs
+index a755947..3ffda6a 100644
+--- a/codex-rs/codex-mcp/src/connection_manager.rs
++++ b/codex-rs/codex-mcp/src/connection_manager.rs
+@@ -226,6 +226,9 @@ impl McpConnectionSet {
+             client_mcp_extensions,
+             auth,
+             auth_manager,
++            codex_apps_auth,
++            codex_apps_auth_manager,
++            codex_apps_codex_home,
+             elicitation_reviewer,
+             elicitation_lifecycle,
+         } = input;
+@@ -276,16 +279,22 @@ impl McpConnectionSet {
+         };
+         let tool_plugin_provenance = Arc::new(tool_plugin_provenance);
+         let startup_submit_id = submit_id;
++        let primary_auth = auth;
++        let codex_apps_auth = codex_apps_auth.as_ref().or(primary_auth);
++        let codex_apps_auth_manager = codex_apps_auth_manager.as_ref().or(auth_manager.as_ref());
++        let codex_apps_codex_home = codex_apps_codex_home.as_ref().unwrap_or(&codex_home);
+         let static_chatgpt_auth_provider = auth
+             .filter(|auth| auth.uses_codex_backend())
+             .map(codex_model_provider::auth_provider_from_auth);
+-        let codex_apps_auth_provider = auth_manager.as_ref().and_then(|auth_manager| {
+-            auth.filter(|auth| auth.uses_codex_backend()).map(|auth| {
+-                codex_model_provider::auth_provider_from_auth_manager(
+-                    Arc::clone(auth_manager),
+-                    auth,
+-                )
+-            })
++        let codex_apps_auth_provider = codex_apps_auth_manager.and_then(|auth_manager| {
++            codex_apps_auth
++                .filter(|auth| auth.uses_codex_backend())
++                .map(|auth| {
++                    codex_model_provider::auth_provider_from_auth_manager(
++                        Arc::clone(auth_manager),
++                        auth,
++                    )
++                })
+         });
+         for (server_name, server) in mcp_servers
+             .into_iter()
+@@ -335,17 +344,21 @@ impl McpConnectionSet {
+             let shares_codex_apps_tools_cache = is_host_owned_codex_apps
+                 && should_share_codex_apps_tools_cache(&server_name, uses_env_bearer_token);
+             let codex_apps_tools_cache_context = shares_codex_apps_tools_cache.then(|| {
+-                codex_apps_tools_cache
+-                    .context(codex_home.clone(), codex_apps_tools_cache_key.clone())
++                codex_apps_tools_cache.context(
++                    codex_apps_codex_home.clone(),
++                    codex_apps_tools_cache_key.clone(),
++                )
+             });
+             // The reserved Codex Apps registration follows the shared
+             // AuthManager across refreshes. In the hosted-plugin path, this
+             // is the ChatGPT /ps/mcp connection. User-configured MCP
+             // registrations keep their existing configured auth path.
+             let chatgpt_auth_provider = if server_name == CODEX_APPS_MCP_SERVER_NAME {
+-                codex_apps_auth_provider
+-                    .clone()
+-                    .or_else(|| static_chatgpt_auth_provider.clone())
++                codex_apps_auth_provider.clone().or_else(|| {
++                    codex_apps_auth
++                        .filter(|auth| auth.uses_codex_backend())
++                        .map(codex_model_provider::auth_provider_from_auth)
++                })
+             } else {
+                 static_chatgpt_auth_provider.clone()
+             };
+@@ -365,8 +378,8 @@ impl McpConnectionSet {
+                     runtime_context: runtime_context.clone(),
+                     resolved_environment: resolved_environment.clone(),
+                     auth_provider: runtime_auth_provider.clone(),
+-                    auth_manager: auth_manager.clone(),
+-                    auth: auth.cloned(),
++                    auth_manager: codex_apps_auth_manager.cloned(),
++                    auth: codex_apps_auth.cloned(),
+                     protocol_mode,
+                     client_mcp_extensions: client_mcp_extensions.clone(),
+                 }));
+@@ -380,9 +393,17 @@ impl McpConnectionSet {
+                 &resolved_environment,
+                 &runtime_context,
+                 runtime_auth_provider.as_ref(),
+-                auth,
+-                shares_codex_apps_tools_cache
+-                    .then(|| (codex_home.clone(), codex_apps_tools_cache_key.clone())),
++                if server_name == CODEX_APPS_MCP_SERVER_NAME {
++                    codex_apps_auth
++                } else {
++                    primary_auth
++                },
++                shares_codex_apps_tools_cache.then(|| {
++                    (
++                        codex_apps_codex_home.clone(),
++                        codex_apps_tools_cache_key.clone(),
++                    )
++                }),
+                 client_elicitation_capability.clone(),
+                 client_mcp_extensions.clone(),
+                 previous
+diff --git a/codex-rs/codex-mcp/src/connection_manager_tests.rs b/codex-rs/codex-mcp/src/connection_manager_tests.rs
+index ecc0060..a0efca4 100644
+--- a/codex-rs/codex-mcp/src/connection_manager_tests.rs
++++ b/codex-rs/codex-mcp/src/connection_manager_tests.rs
+@@ -2000,6 +2000,9 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
+             client_mcp_extensions: ClientMcpExtensions::default(),
+             auth: None,
+             auth_manager: None,
++            codex_apps_auth: None,
++            codex_apps_auth_manager: None,
++            codex_apps_codex_home: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
+         },
+@@ -4215,6 +4218,9 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
+                 client_mcp_extensions: ClientMcpExtensions::default(),
+                 auth: Some(hosted_auth.clone()),
+                 auth_manager: None,
++                codex_apps_auth: None,
++                codex_apps_auth_manager: None,
++                codex_apps_codex_home: None,
+                 elicitation_reviewer: None,
+                 elicitation_lifecycle: None,
+             },
+@@ -4334,6 +4340,9 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
+             client_mcp_extensions: ClientMcpExtensions::default(),
+             auth: None,
+             auth_manager: None,
++            codex_apps_auth: None,
++            codex_apps_auth_manager: None,
++            codex_apps_codex_home: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
+         },
+@@ -4766,6 +4775,9 @@ async fn reconcile_reusable_server_with_mcp_config(
+             client_mcp_extensions: ClientMcpExtensions::default(),
+             auth: None,
+             auth_manager: None,
++            codex_apps_auth: None,
++            codex_apps_auth_manager: None,
++            codex_apps_codex_home: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
+         },
+@@ -5221,6 +5233,9 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
+             client_mcp_extensions: ClientMcpExtensions::default(),
+             auth: None,
+             auth_manager: None,
++            codex_apps_auth: None,
++            codex_apps_auth_manager: None,
++            codex_apps_codex_home: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
+         },
+@@ -5279,6 +5294,9 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
+             client_mcp_extensions: ClientMcpExtensions::default(),
+             auth: None,
+             auth_manager: None,
++            codex_apps_auth: None,
++            codex_apps_auth_manager: None,
++            codex_apps_codex_home: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
+         },
+diff --git a/codex-rs/codex-mcp/src/mcp/mod.rs b/codex-rs/codex-mcp/src/mcp/mod.rs
+index 1042230..31449fa 100644
+--- a/codex-rs/codex-mcp/src/mcp/mod.rs
++++ b/codex-rs/codex-mcp/src/mcp/mod.rs
+@@ -440,6 +440,9 @@ pub async fn read_mcp_resource(
+             client_mcp_extensions: ClientMcpExtensions::default(),
+             auth: auth.cloned(),
+             auth_manager: None,
++            codex_apps_auth: None,
++            codex_apps_auth_manager: None,
++            codex_apps_codex_home: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
+         },
+@@ -515,6 +518,9 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
+             client_mcp_extensions: ClientMcpExtensions::default(),
+             auth: auth.cloned(),
+             auth_manager: None,
++            codex_apps_auth: None,
++            codex_apps_auth_manager: None,
++            codex_apps_codex_home: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
+         },
+diff --git a/codex-rs/codex-mcp/src/runtime.rs b/codex-rs/codex-mcp/src/runtime.rs
+index dc30070..1f6bc53 100644
+--- a/codex-rs/codex-mcp/src/runtime.rs
++++ b/codex-rs/codex-mcp/src/runtime.rs
+@@ -82,6 +82,12 @@ pub struct McpRuntimeInput {
+     pub client_mcp_extensions: ClientMcpExtensions,
+     pub auth: Option<CodexAuth>,
+     pub auth_manager: Option<Arc<AuthManager>>,
++    /// Optional ChatGPT identity used only by the reserved Codex Apps server.
++    pub codex_apps_auth: Option<CodexAuth>,
++    /// Refreshing auth source paired with `codex_apps_auth`.
++    pub codex_apps_auth_manager: Option<Arc<AuthManager>>,
++    /// Storage root used to isolate connector tool caches from the primary account.
++    pub codex_apps_codex_home: Option<PathBuf>,
+     pub elicitation_reviewer: Option<ElicitationReviewerHandle>,
+     pub elicitation_lifecycle: Option<ElicitationLifecycle>,
+ }
+diff --git a/codex-rs/core/src/connectors.rs b/codex-rs/core/src/connectors.rs
+index ba6ca1a..68168cf 100644
+--- a/codex-rs/core/src/connectors.rs
++++ b/codex-rs/core/src/connectors.rs
+@@ -210,8 +210,11 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+     environment_manager: Arc<EnvironmentManager>,
+     mcp_manager: Arc<McpManager>,
+ ) -> anyhow::Result<AccessibleConnectorsStatus> {
+-    let auth_manager =
+-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
++    let codex_apps_auth_context = mcp_manager.codex_apps_auth();
++    let auth_manager = match codex_apps_auth_context.as_ref() {
++        Some(context) => Arc::clone(&context.auth_manager),
++        None => AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?,
++    };
+     let auth = auth_manager.auth().await;
+     if !config
+         .features
+@@ -269,6 +272,9 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+         client_mcp_extensions: ClientMcpExtensions::default(),
+         auth: auth.clone(),
+         auth_manager: codex_apps_auth_manager,
++        codex_apps_auth: None,
++        codex_apps_auth_manager: None,
++        codex_apps_codex_home: codex_apps_auth_context.map(|context| context.codex_home),
+         elicitation_reviewer: None,
+         elicitation_lifecycle: None,
+     })
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index b4e9792..b9b2f7f 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -77,6 +77,7 @@ mod mcp_skill_dependencies;
+ mod mcp_tool_approval_templates;
+ mod mcp_tool_exposure;
+ mod network_policy_decision;
++pub use mcp::CodexAppsAuthContext;
+ pub use mcp::McpManager;
+ mod original_image_detail;
+ pub use codex_mcp::CodexAppsToolsCache;
+diff --git a/codex-rs/core/src/mcp.rs b/codex-rs/core/src/mcp.rs
+index 193fc94..d0f87a6 100644
+--- a/codex-rs/core/src/mcp.rs
++++ b/codex-rs/core/src/mcp.rs
+@@ -1,5 +1,7 @@
+ use std::collections::HashMap;
++use std::path::PathBuf;
+ use std::sync::Arc;
++use std::sync::RwLock;
+ 
+ use crate::config::Config;
+ use crate::environment_selection::ThreadEnvironments;
+@@ -18,6 +20,7 @@ use codex_extension_api::McpServerContributionContext;
+ use codex_extension_api::SelectedPluginIdentity;
+ use codex_extension_api::SelectedPluginSnapshot;
+ use codex_features::Feature;
++use codex_login::AuthManager;
+ use codex_login::CodexAuth;
+ use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+ use codex_mcp::EffectiveMcpServer;
+@@ -76,6 +79,13 @@ pub struct McpManager {
+     extensions: Arc<ExtensionRegistry<Config>>,
+     codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
+     tool_catalog_cache: McpToolCatalogCache,
++    codex_apps_auth: Arc<RwLock<Option<CodexAppsAuthContext>>>,
++}
++
++#[derive(Clone)]
++pub struct CodexAppsAuthContext {
++    pub codex_home: PathBuf,
++    pub auth_manager: Arc<AuthManager>,
+ }
+ 
+ impl McpManager {
+@@ -98,9 +108,23 @@ impl McpManager {
+             extensions,
+             codex_apps_tools_cache,
+             tool_catalog_cache: McpToolCatalogCache::default(),
++            codex_apps_auth: Arc::new(RwLock::new(None)),
++        }
++    }
++
++    pub fn set_codex_apps_auth(&self, context: Option<CodexAppsAuthContext>) {
++        if let Ok(mut auth) = self.codex_apps_auth.write() {
++            *auth = context;
+         }
+     }
+ 
++    pub fn codex_apps_auth(&self) -> Option<CodexAppsAuthContext> {
++        self.codex_apps_auth
++            .read()
++            .ok()
++            .and_then(|auth| auth.clone())
++    }
++
+     pub fn codex_apps_tools_cache(&self) -> ConnectorRuntimeManager<ToolInfo> {
+         self.codex_apps_tools_cache.clone()
+     }
+diff --git a/codex-rs/core/src/session/mcp_runtime.rs b/codex-rs/core/src/session/mcp_runtime.rs
+index c3c329e..d5fa4ea 100644
+--- a/codex-rs/core/src/session/mcp_runtime.rs
++++ b/codex-rs/core/src/session/mcp_runtime.rs
+@@ -331,6 +331,11 @@ impl Session {
+         elicitation_reviewer: Option<ElicitationReviewerHandle>,
+     ) -> McpRuntimeInput {
+         let auth = desired.auth.clone();
++        let codex_apps_auth_context = self.services.mcp_manager.codex_apps_auth();
++        let codex_apps_auth = codex_apps_auth_context
++            .as_ref()
++            .and_then(|context| context.auth_manager.auth_cached());
++        let effective_codex_apps_auth = codex_apps_auth.as_ref().or(auth.as_ref());
+         let McpRuntimeProjection {
+             mut config,
+             plugins_available,
+@@ -353,7 +358,7 @@ impl Session {
+             .environment_cwds
+             .entry(codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string())
+             .or_insert_with(|| PathUri::from_abs_path(&desired.config.cwd));
+-        let mcp_servers = effective_mcp_servers(&config, auth.as_ref());
++        let mcp_servers = effective_mcp_servers(&config, effective_codex_apps_auth);
+         config.set_server_permission_profiles(
+             &mcp_servers,
+             desired.environments.turn_environments().map(|environment| {
+@@ -396,10 +401,15 @@ impl Session {
+             runtime_context,
+             codex_apps_tools_cache: self.services.mcp_manager.codex_apps_tools_cache(),
+             tool_catalog_cache: self.services.mcp_manager.tool_catalog_cache(),
+-            codex_apps_tools_cache_key: connector_runtime_context_key(auth.as_ref()),
++            codex_apps_tools_cache_key: connector_runtime_context_key(effective_codex_apps_auth),
+             client_mcp_extensions: self.services.client_mcp_extensions.for_mcp_servers(),
+             auth,
+             auth_manager: Some(Arc::clone(&self.services.auth_manager)),
++            codex_apps_auth,
++            codex_apps_auth_manager: codex_apps_auth_context
++                .as_ref()
++                .map(|context| Arc::clone(&context.auth_manager)),
++            codex_apps_codex_home: codex_apps_auth_context.map(|context| context.codex_home),
+             elicitation_reviewer,
+             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
+         }
