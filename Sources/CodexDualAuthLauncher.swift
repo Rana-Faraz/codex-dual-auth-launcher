@@ -240,7 +240,7 @@ final class LauncherModel: ObservableObject {
                         "clientInfo": [
                             "name": "codex_dual_auth_launcher",
                             "title": "Codex Dual Auth Launcher",
-                            "version": "0.1.3",
+                            "version": "0.1.4",
                         ],
                         "capabilities": ["experimentalApi": true],
                     ],

@@ -1,3 +1,27 @@
+diff --git a/codex-rs/app-server/src/config_manager.rs b/codex-rs/app-server/src/config_manager.rs
+index f62118d..23c87f2 100644
+--- a/codex-rs/app-server/src/config_manager.rs
++++ b/codex-rs/app-server/src/config_manager.rs
+@@ -64,6 +64,19 @@ impl ConfigManager {
+         self.codex_home.as_path()
+     }
+ 
++    pub(crate) fn clone_for_codex_home(&self, codex_home: PathBuf) -> Self {
++        Self {
++            codex_home,
++            cli_overrides: Arc::clone(&self.cli_overrides),
++            runtime_feature_enablement: Arc::clone(&self.runtime_feature_enablement),
++            loader_overrides: self.loader_overrides.clone(),
++            strict_config: self.strict_config,
++            cloud_config_bundle: Arc::new(RwLock::new(CloudConfigBundleLoader::default())),
++            arg0_paths: self.arg0_paths.clone(),
++            thread_config_loader: Arc::clone(&self.thread_config_loader),
++        }
++    }
++
+     pub(crate) fn user_config_path(&self) -> std::io::Result<AbsolutePathBuf> {
+         self.loader_overrides.user_config_path(self.codex_home())
+     }
 diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
 index 12f82e6..10613d6 100644
 --- a/codex-rs/app-server/src/in_process.rs
@@ -29,7 +53,7 @@ index 76709f8..95c9fe0 100644
  use codex_utils_cli::CliConfigOverrides;
 @@ -80,6 +82,53 @@ use tracing_subscriber::registry::Registry;
  use tracing_subscriber::util::SubscriberInitExt;
-
+ 
  const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
 +const CODEX_CONNECTORS_HOME_ENV_VAR: &str = "CODEX_CONNECTORS_HOME";
 +
@@ -78,7 +102,7 @@ index 76709f8..95c9fe0 100644
 +        auth_manager,
 +    }))
 +}
-
+ 
  fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool {
      err.get_ref().is_some_and(
 @@ -755,6 +804,7 @@ pub async fn run_main_with_transport_options(
@@ -86,7 +110,7 @@ index 76709f8..95c9fe0 100644
              .await
              .map_err(std::io::Error::other)?;
 +    let codex_apps_auth = codex_apps_auth_context_from_env(&config).await?;
-
+ 
      let remote_control_enabled = remote_control_policy == RemoteControlPolicy::Allowed
          && remote_control_explicitly_requested
 @@ -917,6 +967,7 @@ pub async fn run_main_with_transport_options(
@@ -98,7 +122,7 @@ index 76709f8..95c9fe0 100644
              code_mode_session_provider,
              rpc_transport: analytics_rpc_transport(&transport),
 diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
-index 8d3e085..cb963c5 100644
+index 8d3e085..30e7b5e 100644
 --- a/codex-rs/app-server/src/message_processor.rs
 +++ b/codex-rs/app-server/src/message_processor.rs
 @@ -254,6 +254,7 @@ pub(crate) struct MessageProcessorArgs {
@@ -109,7 +133,7 @@ index 8d3e085..cb963c5 100644
      pub(crate) installation_id: String,
      pub(crate) code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>>,
      pub(crate) rpc_transport: AppServerRpcTransport,
-@@ -278,6 +279,7 @@ impl MessageProcessor {
+@@ -278,12 +279,28 @@ impl MessageProcessor {
              config_warnings,
              session_source,
              auth_manager,
@@ -117,17 +141,64 @@ index 8d3e085..cb963c5 100644
              installation_id,
              code_mode_session_provider,
              rpc_transport,
-@@ -357,6 +359,9 @@ impl MessageProcessor {
+             remote_control_handle,
+             plugin_startup_tasks,
+         } = args;
++        let plugin_auth_manager = codex_apps_auth
++            .as_ref()
++            .map(|context| Arc::clone(&context.auth_manager))
++            .unwrap_or_else(|| Arc::clone(&auth_manager));
++        let plugin_config_manager = if let Some(context) = codex_apps_auth.as_ref() {
++            let manager = config_manager.clone_for_codex_home(context.codex_home.clone());
++            manager.replace_cloud_config_bundle_loader(
++                Arc::clone(&context.auth_manager),
++                config.chatgpt_base_url.clone(),
++                config.http_client_factory(),
++            );
++            manager
++        } else {
++            config_manager.clone()
++        };
+         let thread_state_manager = ThreadStateManager::new();
+         // The thread store is intentionally process-scoped. Config reloads can
+         // affect per-thread behavior, but they must not move newly started,
+@@ -357,6 +374,13 @@ impl MessageProcessor {
                      thread_state_manager.clone(),
                  )),
              );
++            let manager = match codex_apps_auth.clone() {
++                Some(context) => manager.with_plugin_auth(context),
++                None => manager,
++            };
 +            manager
 +                .mcp_manager()
 +                .set_codex_apps_auth(codex_apps_auth.clone());
              match code_mode_session_provider {
                  Some(provider) => manager.with_code_mode_session_provider(provider),
                  None => manager,
-@@ -404,7 +409,13 @@ impl MessageProcessor {
+@@ -388,12 +412,18 @@ impl MessageProcessor {
+             thread_manager.clone(),
+             analytics_events_client.clone(),
+         );
++        let plugin_config_processor = ConfigRequestProcessor::new(
++            outgoing.clone(),
++            plugin_config_manager.clone(),
++            thread_manager.clone(),
++            analytics_events_client.clone(),
++        );
+         let on_effective_plugins_changed =
+             crate::effective_plugin_change::effective_plugins_changed_callback(
+-                auth_manager.clone(),
++                plugin_auth_manager.clone(),
+                 Arc::clone(&thread_manager),
+-                config_manager.clone(),
+-                config_processor.clone(),
++                plugin_config_manager.clone(),
++                plugin_config_processor,
+                 request_serialization_queues.clone(),
+             );
+         let account_processor = AccountRequestProcessor::new(
+@@ -404,7 +434,13 @@ impl MessageProcessor {
              config_manager.clone(),
          );
          let apps_processor = AppsRequestProcessor::new(
@@ -142,6 +213,30 @@ index 8d3e085..cb963c5 100644
              Arc::clone(&thread_manager),
              outgoing.clone(),
              config_manager.clone(),
+@@ -445,8 +481,7 @@ impl MessageProcessor {
+             rpc_transport,
+         );
+         let marketplace_processor = MarketplaceRequestProcessor::new(
+-            Arc::clone(&config),
+-            config_manager.clone(),
++            plugin_config_manager.clone(),
+             Arc::clone(&thread_manager),
+         );
+         let mcp_processor = McpRequestProcessor::new(
+@@ -457,11 +492,11 @@ impl MessageProcessor {
+             config_manager.clone(),
+         );
+         let plugin_processor = PluginRequestProcessor::new(
+-            auth_manager.clone(),
++            plugin_auth_manager,
+             Arc::clone(&thread_manager),
+             outgoing.clone(),
+             analytics_events_client.clone(),
+-            config_manager.clone(),
++            plugin_config_manager,
+             on_effective_plugins_changed,
+         );
+         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
 diff --git a/codex-rs/app-server/src/message_processor_tracing_tests.rs b/codex-rs/app-server/src/message_processor_tracing_tests.rs
 index 842563e..6273483 100644
 --- a/codex-rs/app-server/src/message_processor_tracing_tests.rs
@@ -155,13 +250,13 @@ index 842563e..6273483 100644
          code_mode_session_provider: None,
          rpc_transport: AppServerRpcTransport::Stdio,
 diff --git a/codex-rs/app-server/src/request_processors/apps_processor.rs b/codex-rs/app-server/src/request_processors/apps_processor.rs
-index 28add51..4732be1 100644
+index 28add51..199d912 100644
 --- a/codex-rs/app-server/src/request_processors/apps_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/apps_processor.rs
 @@ -7,8 +7,15 @@ mod read;
-
+ 
  pub(super) use read::APP_READ_MAX_IDS;
-
+ 
 +fn apps_codex_home(primary_codex_home: &Path, connector_codex_home: Option<&Path>) -> PathBuf {
 +    connector_codex_home
 +        .unwrap_or(primary_codex_home)
@@ -190,17 +285,27 @@ index 28add51..4732be1 100644
              thread_manager,
              outgoing,
              config_manager,
-@@ -82,6 +91,9 @@ impl AppsRequestProcessor {
+@@ -70,6 +79,9 @@ impl AppsRequestProcessor {
+                 .set_enabled(Feature::Apps, thread.enabled(Feature::Apps));
+         }
+ 
++        if params.force_refetch {
++            self.auth_manager.reload().await;
++        }
+         let auth = self.auth_manager.auth().await;
+         if !config
+             .features
+@@ -82,6 +94,9 @@ impl AppsRequestProcessor {
              record_legacy_apps_installed_duration(installed_start, reload);
              return Ok(Some(response));
          }
 +        let Some(auth) = auth else {
 +            return Err(internal_error("ChatGPT auth not available for Apps"));
 +        };
-
+ 
          let request = request_id.clone();
          let outgoing = Arc::clone(&self.outgoing);
-@@ -89,6 +101,7 @@ impl AppsRequestProcessor {
+@@ -89,6 +104,7 @@ impl AppsRequestProcessor {
          let mcp_manager = self.thread_manager.mcp_manager();
          let plugins_manager = self.thread_manager.plugins_manager();
          let shutdown_token = self.shutdown_token.child_token();
@@ -208,7 +313,7 @@ index 28add51..4732be1 100644
          tokio::spawn(async move {
              tokio::select! {
                  _ = shutdown_token.cancelled() => {}
-@@ -97,6 +110,8 @@ impl AppsRequestProcessor {
+@@ -97,6 +113,8 @@ impl AppsRequestProcessor {
                      request,
                      params,
                      config,
@@ -217,7 +322,7 @@ index 28add51..4732be1 100644
                      environment_manager,
                      mcp_manager,
                      plugins_manager,
-@@ -117,6 +132,8 @@ impl AppsRequestProcessor {
+@@ -117,6 +135,8 @@ impl AppsRequestProcessor {
          request_id: ConnectionRequestId,
          params: AppsListParams,
          config: Config,
@@ -226,7 +331,7 @@ index 28add51..4732be1 100644
          environment_manager: Arc<EnvironmentManager>,
          mcp_manager: Arc<McpManager>,
          plugins_manager: Arc<PluginsManager>,
-@@ -125,6 +142,8 @@ impl AppsRequestProcessor {
+@@ -125,6 +145,8 @@ impl AppsRequestProcessor {
          let reload = params.force_refetch;
          let retry_params = params.clone();
          let retry_config = config.clone();
@@ -235,7 +340,7 @@ index 28add51..4732be1 100644
          let retry_environment_manager = Arc::clone(&environment_manager);
          let retry_mcp_manager = Arc::clone(&mcp_manager);
          let retry_plugins_manager = Arc::clone(&plugins_manager);
-@@ -132,6 +151,8 @@ impl AppsRequestProcessor {
+@@ -132,6 +154,8 @@ impl AppsRequestProcessor {
              &outgoing,
              params,
              config,
@@ -244,7 +349,7 @@ index 28add51..4732be1 100644
              environment_manager,
              mcp_manager,
              plugins_manager,
-@@ -154,6 +175,8 @@ impl AppsRequestProcessor {
+@@ -154,6 +178,8 @@ impl AppsRequestProcessor {
                  &outgoing,
                  retry_params,
                  retry_config,
@@ -253,7 +358,7 @@ index 28add51..4732be1 100644
                  retry_environment_manager,
                  retry_mcp_manager,
                  retry_plugins_manager,
-@@ -169,6 +192,8 @@ impl AppsRequestProcessor {
+@@ -169,6 +195,8 @@ impl AppsRequestProcessor {
          outgoing: &Arc<OutgoingMessageSender>,
          params: AppsListParams,
          config: Config,
@@ -262,7 +367,7 @@ index 28add51..4732be1 100644
          environment_manager: Arc<EnvironmentManager>,
          mcp_manager: Arc<McpManager>,
          plugins_manager: Arc<PluginsManager>,
-@@ -196,8 +221,16 @@ impl AppsRequestProcessor {
+@@ -196,8 +224,16 @@ impl AppsRequestProcessor {
              );
          let plugin_apps = connector_snapshot.connector_ids().to_vec();
          let (mut accessible_connectors, mut all_connectors) = tokio::join!(
@@ -280,10 +385,10 @@ index 28add51..4732be1 100644
 +            )
          );
          let cached_all_connectors = all_connectors.clone();
-
-@@ -218,10 +251,14 @@ impl AppsRequestProcessor {
+ 
+@@ -218,10 +254,14 @@ impl AppsRequestProcessor {
          });
-
+ 
          let all_config = config.clone();
 +        let all_auth = auth.clone();
 +        let all_apps_codex_home = apps_codex_home.clone();
@@ -297,10 +402,10 @@ index 28add51..4732be1 100644
                  force_refetch,
                  &all_plugin_apps,
              )
-@@ -367,6 +404,31 @@ impl AppsRequestProcessor {
+@@ -367,6 +407,31 @@ impl AppsRequestProcessor {
      }
  }
-
+ 
 +#[cfg(test)]
 +mod tests {
 +    use super::apps_codex_home;
@@ -335,7 +440,7 @@ index 8b2ccbc..0a85cc7 100644
 +++ b/codex-rs/app-server/src/request_processors/apps_processor/installed.rs
 @@ -56,6 +56,8 @@ impl AppsRequestProcessor {
                  .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend));
-
+ 
              let mcp_manager = self.thread_manager.mcp_manager();
 +            let apps_codex_home =
 +                apps_codex_home(&config.codex_home, self.codex_home.as_deref());
@@ -372,6 +477,179 @@ index 8b2ccbc..0a85cc7 100644
                              .ok_or_else(|| {
                                  anyhow::anyhow!(
                                      "hosted connector refresh completed without publishing a snapshot"
+diff --git a/codex-rs/app-server/src/request_processors/marketplace_processor.rs b/codex-rs/app-server/src/request_processors/marketplace_processor.rs
+index 77291f6..62d00e0 100644
+--- a/codex-rs/app-server/src/request_processors/marketplace_processor.rs
++++ b/codex-rs/app-server/src/request_processors/marketplace_processor.rs
+@@ -2,19 +2,13 @@ use super::*;
+ 
+ #[derive(Clone)]
+ pub(crate) struct MarketplaceRequestProcessor {
+-    config: Arc<Config>,
+     config_manager: ConfigManager,
+     thread_manager: Arc<ThreadManager>,
+ }
+ 
+ impl MarketplaceRequestProcessor {
+-    pub(crate) fn new(
+-        config: Arc<Config>,
+-        config_manager: ConfigManager,
+-        thread_manager: Arc<ThreadManager>,
+-    ) -> Self {
++    pub(crate) fn new(config_manager: ConfigManager, thread_manager: Arc<ThreadManager>) -> Self {
+         Self {
+-            config,
+             config_manager,
+             thread_manager,
+         }
+@@ -116,7 +110,7 @@ impl MarketplaceRequestProcessor {
+     ) -> Result<MarketplaceAddResponse, JSONRPCErrorError> {
+         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+         add_marketplace_to_codex_home(
+-            self.config.codex_home.to_path_buf(),
++            config.codex_home.to_path_buf(),
+             config.config_layer_stack.requirements().clone(),
+             MarketplaceAddRequest {
+                 source: params.source,
+diff --git a/codex-rs/app-server/tests/suite/v2/plugin_list.rs b/codex-rs/app-server/tests/suite/v2/plugin_list.rs
+index 3f83936..5dd0bad 100644
+--- a/codex-rs/app-server/tests/suite/v2/plugin_list.rs
++++ b/codex-rs/app-server/tests/suite/v2/plugin_list.rs
+@@ -28,6 +28,8 @@ use codex_app_server_protocol::PluginListMarketplaceKind;
+ use codex_app_server_protocol::PluginListParams;
+ use codex_app_server_protocol::PluginListResponse;
+ use codex_app_server_protocol::PluginMarketplaceEntry;
++use codex_app_server_protocol::PluginReadParams;
++use codex_app_server_protocol::PluginReadResponse;
+ use codex_app_server_protocol::PluginShareDiscoverability;
+ use codex_app_server_protocol::PluginSource;
+ use codex_app_server_protocol::PluginSummary;
+@@ -106,6 +108,125 @@ remote_plugin = false
+     )
+ }
+ 
++fn write_dual_auth_plugin_config(
++    codex_home: &std::path::Path,
++    base_url: &str,
++    plugin_name: &str,
++) -> std::io::Result<()> {
++    std::fs::write(
++        codex_home.join("config.toml"),
++        format!(
++            r#"chatgpt_base_url = "{base_url}"
++
++[features]
++plugins = true
++remote_plugin = false
++
++[plugins."{plugin_name}@openai-curated"]
++enabled = true
++"#,
++        ),
++    )
++}
++
++#[tokio::test]
++async fn plugin_list_uses_connector_profile_when_dual_auth_is_enabled() -> Result<()> {
++    let account_a_home = TempDir::new()?;
++    let account_b_home = TempDir::new()?;
++    let server = MockServer::start().await;
++    let base_url = format!("{}/backend-api/", server.uri());
++
++    write_dual_auth_plugin_config(account_a_home.path(), &base_url, "account-a-plugin")?;
++    write_dual_auth_plugin_config(account_b_home.path(), &base_url, "account-b-plugin")?;
++    write_openai_curated_marketplace(account_a_home.path(), &["account-a-plugin"])?;
++    write_openai_curated_marketplace(account_b_home.path(), &["account-b-plugin"])?;
++    write_installed_plugin(&account_a_home, "openai-curated", "account-a-plugin")?;
++    write_installed_plugin(&account_b_home, "openai-curated", "account-b-plugin")?;
++    write_chatgpt_auth(
++        account_a_home.path(),
++        ChatGptAuthFixture::new("account-a-token")
++            .account_id("account-a")
++            .chatgpt_user_id("user-a")
++            .chatgpt_account_id("account-a"),
++        AuthCredentialsStoreMode::File,
++    )?;
++    write_chatgpt_auth(
++        account_b_home.path(),
++        ChatGptAuthFixture::new("account-b-token")
++            .account_id("account-b")
++            .chatgpt_user_id("user-b")
++            .chatgpt_account_id("account-b"),
++        AuthCredentialsStoreMode::File,
++    )?;
++
++    let connector_home = account_b_home.path().to_string_lossy().into_owned();
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(account_a_home.path())
++        .with_env_overrides(&[("CODEX_CONNECTORS_HOME", Some(connector_home.as_str()))])
++        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
++        .await?;
++
++    let request_id = mcp
++        .send_plugin_list_request(PluginListParams {
++            cwds: None,
++            marketplace_kinds: None,
++            force_refetch: false,
++        })
++        .await?;
++    let response: PluginListResponse =
++        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
++    let installed_names = response
++        .marketplaces
++        .iter()
++        .flat_map(|marketplace| &marketplace.plugins)
++        .filter(|plugin| plugin.installed)
++        .map(|plugin| plugin.name.as_str())
++        .collect::<Vec<_>>();
++
++    assert!(
++        installed_names.contains(&"account-b-plugin"),
++        "dual-auth plugin/list must use account B's plugin home: {installed_names:?}"
++    );
++    assert!(
++        !installed_names.contains(&"account-a-plugin"),
++        "dual-auth plugin/list must not leak account A's installed plugins: {installed_names:?}"
++    );
++
++    let request_id = mcp
++        .send_plugin_installed_request(PluginInstalledParams {
++            cwds: None,
++            install_suggestion_plugin_names: None,
++        })
++        .await?;
++    let installed_response: PluginInstalledResponse =
++        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
++    let installed_names = installed_response
++        .marketplaces
++        .iter()
++        .flat_map(|marketplace| &marketplace.plugins)
++        .map(|plugin| plugin.name.as_str())
++        .collect::<Vec<_>>();
++    assert_eq!(installed_names, vec!["account-b-plugin"]);
++
++    let marketplace_path = response
++        .marketplaces
++        .iter()
++        .find(|marketplace| marketplace.name == "openai-curated")
++        .and_then(|marketplace| marketplace.path.clone())
++        .expect("account B marketplace path");
++    let request_id = mcp
++        .send_plugin_read_request(PluginReadParams {
++            marketplace_path: Some(marketplace_path),
++            remote_marketplace_name: None,
++            plugin_name: "account-b-plugin".to_string(),
++        })
++        .await?;
++    let read_response: PluginReadResponse =
++        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
++    assert_eq!(read_response.plugin.summary.name, "account-b-plugin");
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn plugin_list_skips_invalid_marketplace_file_and_reports_error() -> Result<()> {
+     let codex_home = TempDir::new()?;
 diff --git a/codex-rs/chatgpt/src/chatgpt_client.rs b/codex-rs/chatgpt/src/chatgpt_client.rs
 index 2e6feb8..ccf2efe 100644
 --- a/codex-rs/chatgpt/src/chatgpt_client.rs
@@ -422,11 +700,11 @@ index ae6cbce..f676980 100644
  use std::collections::HashSet;
 +use std::path::Path;
  use std::time::Duration;
-
+ 
 -use crate::chatgpt_client::chatgpt_get_request_with_timeout;
 +use crate::chatgpt_client::chatgpt_get_request_with_auth_and_timeout;
  use crate::chatgpt_client::chatgpt_post_request_with_timeout;
-
+ 
  use codex_connectors::AppInfo;
 @@ -22,6 +23,7 @@ pub use codex_core::connectors::list_accessible_connectors_from_mcp_tools_with_m
  pub use codex_core::connectors::list_accessible_connectors_from_mcp_tools_with_options;
@@ -457,7 +735,7 @@ index ae6cbce..f676980 100644
 +    {
          return Some(Vec::new());
      }
-
+ 
 -    let auth = connector_auth(config).await.ok()?;
 -    let cache_context = connector_directory_cache_context(config, &auth);
 +    let cache_context = connector_directory_cache_context(config, auth, codex_home);
@@ -763,7 +1041,7 @@ index ba6ca1a..9abdbed 100644
 +    let cache_key = accessible_connectors_cache_key(config, auth);
      read_cached_accessible_connectors(&cache_key)
  }
-
+ 
 @@ -210,8 +217,11 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
      environment_manager: Arc<EnvironmentManager>,
      mcp_manager: Arc<McpManager>,
@@ -809,7 +1087,7 @@ index 193fc94..d0f87a6 100644
 +use std::path::PathBuf;
  use std::sync::Arc;
 +use std::sync::RwLock;
-
+ 
  use crate::config::Config;
  use crate::environment_selection::ThreadEnvironments;
 @@ -18,6 +20,7 @@ use codex_extension_api::McpServerContributionContext;
@@ -832,7 +1110,7 @@ index 193fc94..d0f87a6 100644
 +    pub codex_home: PathBuf,
 +    pub auth_manager: Arc<AuthManager>,
  }
-
+ 
  impl McpManager {
 @@ -98,9 +108,23 @@ impl McpManager {
              extensions,
@@ -847,7 +1125,7 @@ index 193fc94..d0f87a6 100644
 +            *auth = context;
          }
      }
-
+ 
 +    pub fn codex_apps_auth(&self) -> Option<CodexAppsAuthContext> {
 +        self.codex_apps_auth
 +            .read()
@@ -900,3 +1178,46 @@ index c3c329e..d5fa4ea 100644
              elicitation_reviewer,
              elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
          }
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index 7f6648b..d6529c9 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -7,6 +7,7 @@ use crate::config::ThreadStoreConfig;
+ use crate::current_time::TimeProvider;
+ use crate::environment_selection::TurnEnvironmentSnapshot;
+ use crate::environment_selection::default_thread_environment_selections;
++use crate::mcp::CodexAppsAuthContext;
+ use crate::mcp::McpManager;
+ use crate::rollout::truncation;
+ use crate::session::ForkPersistence;
+@@ -510,6 +511,30 @@ impl ThreadManager {
+         }
+     }
+ 
++    /// Rebinds plugin discovery and runtime resolution to a secondary Codex account.
++    ///
++    /// This must be called before the thread manager is shared. Thread persistence,
++    /// model authentication, and host skills remain attached to the primary profile.
++    pub fn with_plugin_auth(mut self, context: CodexAppsAuthContext) -> Self {
++        let Some(state) = Arc::get_mut(&mut self.state) else {
++            unreachable!("plugin auth must be set before thread manager is shared");
++        };
++        let plugins_manager = Arc::new(PluginsManager::new_with_options(
++            context.codex_home,
++            state.session_source.restriction_product(),
++            context.auth_manager,
++            state.skills_service.clone(),
++        ));
++        let mcp_manager = Arc::new(McpManager::new_with_extensions(
++            Arc::clone(&plugins_manager),
++            Arc::clone(&state.extensions),
++            state.mcp_manager.codex_apps_tools_cache(),
++        ));
++        state.plugins_manager = plugins_manager;
++        state.mcp_manager = mcp_manager;
++        self
++    }
++
+     /// Generate every new thread identifier with the caller-provided factory.
+     pub fn with_thread_id_generator(
+         mut self,

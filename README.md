@@ -12,7 +12,7 @@ Prerequisites: Apple-silicon Mac running macOS 14 or later, with the official Co
 /bin/zsh -c "$(curl -fsSL https://raw.githubusercontent.com/Rana-Faraz/codex-dual-auth-launcher/main/install.sh)"
 ```
 
-The installer downloads the pinned `v0.1.3` release, checks its SHA-256 digest and code signature, installs it to `~/Applications/Codex Dual Auth.app`, and opens it. It does not modify the official Codex app.
+The installer downloads the pinned `v0.1.4` release, checks its SHA-256 digest and code signature, installs it to `~/Applications/Codex Dual Auth.app`, and opens it. It does not modify the official Codex app.
 
 Then:
 
@@ -56,10 +56,13 @@ cd codex-dual-auth-launcher
 
 The script fetches the pinned upstream Codex revision, applies [`patches/codex-dual-auth.patch`](patches/codex-dual-auth.patch), builds the Rust CLI, its matching `codex-code-mode-host`, and the SwiftUI launcher, strips symbols, ad-hoc signs the app, and writes the result to `dist/`. The host build uses OpenAI Codex's verified V8 artifact workflow.
 
-## Validation performed for v0.1.3
+## Validation performed for v0.1.4
 
 - `cargo check -p codex-mcp -p codex-core -p codex-app-server`
-- All 215 `codex-mcp` tests through the repository's `just test`/Nextest harness
+- Focused app-server suites for Apps, plugins, marketplace, MCP status, selected capabilities, and executor MCP
+- Dual-profile `plugin/list`, `plugin/installed`, and `plugin/read` regression: account B is returned and account A does not leak
+- Account-B authentication reload and failed-refresh cache-preservation regressions
+- All 215 `codex-mcp` tests and all 431 `codex-core-plugins` tests
 - Swift type-check and property-list validation
 - Mach-O deployment-target regression check (`minos 14.0`)
 - Required matching `codex-code-mode-host` presence, architecture, and startup checks
