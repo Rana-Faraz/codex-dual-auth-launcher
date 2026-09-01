@@ -3,10 +3,35 @@ import SwiftUI
 
 @MainActor
 final class LauncherModel: ObservableObject {
+    struct ConnectorAccount: Equatable {
+        let email: String?
+        let planType: String?
+
+        var displayName: String {
+            guard let email, !email.isEmpty else { return "ChatGPT account" }
+            return email
+        }
+
+        var planDisplayName: String? {
+            guard let planType, !planType.isEmpty else { return nil }
+            let knownNames = [
+                "free": "Free",
+                "plus": "Plus",
+                "pro": "Pro",
+                "prolite": "Pro Lite",
+                "team": "Team",
+                "business": "Business",
+                "enterprise": "Enterprise",
+                "edu": "Education",
+            ]
+            return "\(knownNames[planType.lowercased()] ?? planType.capitalized) plan"
+        }
+    }
+
     enum LoginState {
         case checking
         case signedOut
-        case signedIn
+        case signedIn(ConnectorAccount)
         case working
         case error(String)
     }
@@ -30,7 +55,7 @@ final class LauncherModel: ObservableObject {
         switch loginState {
         case .checking: return "Checking connector account…"
         case .signedOut: return "Connector account is not signed in"
-        case .signedIn: return "Connector account is ready"
+        case .signedIn: return "Connector account connected"
         case .working: return "Waiting for browser sign-in…"
         case .error(let message): return message
         }
@@ -43,26 +68,57 @@ final class LauncherModel: ObservableObject {
         }
     }
 
+    var connectedAccount: ConnectorAccount? {
+        guard case .signedIn(let account) = loginState else { return nil }
+        return account
+    }
+
     func refreshStatus() async {
         loginState = .checking
         do {
             try prepareConnectorHome()
-            let result = try await runConnectorCodex(arguments: ["login", "status"])
-            loginState = result.exitCode == 0 ? .signedIn : .signedOut
+            if let account = try await readConnectorAccount() {
+                loginState = .signedIn(account)
+            } else {
+                loginState = .signedOut
+            }
         } catch {
             loginState = .error(error.localizedDescription)
         }
     }
 
     func signIn() async {
+        await authenticate(clearExistingAccount: false)
+    }
+
+    func changeAccount() async {
+        await authenticate(clearExistingAccount: true)
+    }
+
+    private func authenticate(clearExistingAccount: Bool) async {
         loginState = .working
-        launchMessage = "Your browser will open. Sign in with the ChatGPT account that owns identity 2's Apps."
+        launchMessage = clearExistingAccount
+            ? "Signing out the current connector profile, then opening ChatGPT sign-in…"
+            : "Your browser will open. Sign in with the ChatGPT account that owns identity 2's Apps."
         do {
             try prepareConnectorHome()
+            if clearExistingAccount {
+                let logoutResult = try await runConnectorCodex(arguments: ["logout"])
+                guard logoutResult.exitCode == 0 else {
+                    loginState = .error("Could not sign out the current connector account.")
+                    launchMessage = logoutResult.summary
+                    return
+                }
+            }
             let result = try await runConnectorCodex(arguments: ["login"])
             if result.exitCode == 0 {
-                loginState = .signedIn
-                launchMessage = "Connector account saved in its isolated profile."
+                if let account = try await readConnectorAccount() {
+                    loginState = .signedIn(account)
+                    launchMessage = "Connected as \(account.displayName)."
+                } else {
+                    loginState = .error("Sign-in finished, but no ChatGPT account was returned.")
+                    launchMessage = "Try Change Account and complete the browser sign-in again."
+                }
             } else {
                 loginState = .error("Connector sign-in did not finish.")
                 launchMessage = result.summary
@@ -75,7 +131,7 @@ final class LauncherModel: ObservableObject {
     func launchCodex() async {
         launchMessage = ""
         await refreshStatus()
-        guard case .signedIn = loginState else {
+        guard connectedAccount != nil else {
             launchMessage = "Sign in to the connector account first."
             return
         }
@@ -108,6 +164,9 @@ final class LauncherModel: ObservableObject {
             process.standardError = FileHandle.nullDevice
             try process.run()
             launchMessage = "Codex launched. Threads and model usage remain on account A; built-in Apps use the connector account."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                NSApp.terminate(nil)
+            }
         } catch {
             launchMessage = "Could not launch Codex: \(error.localizedDescription)"
         }
@@ -130,6 +189,110 @@ final class LauncherModel: ObservableObject {
     private struct CommandResult: Sendable {
         let exitCode: Int32
         let summary: String
+    }
+
+    private struct AccountReadResult: Decodable {
+        struct Account: Decodable {
+            let email: String?
+            let planType: String?
+            let type: String
+        }
+
+        let account: Account?
+    }
+
+    private struct AccountReadEnvelope: Decodable {
+        let id: String?
+        let result: AccountReadResult?
+    }
+
+    private func readConnectorAccount() async throws -> ConnectorAccount? {
+        guard let codexURL = bundledCodex else {
+            throw NSError(
+                domain: "CodexDualAuthLauncher",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The packaged dual-auth Codex binary is missing."]
+            )
+        }
+        let home = connectorHome
+        return try await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = codexURL
+            process.arguments = ["app-server", "--listen", "stdio://"]
+            var environment = ProcessInfo.processInfo.environment
+            environment["CODEX_HOME"] = home.path
+            environment.removeValue(forKey: "CODEX_CONNECTORS_HOME")
+            environment.removeValue(forKey: "CODEX_CONNECTORS_TOKEN")
+            process.environment = environment
+
+            let input = Pipe()
+            let output = Pipe()
+            process.standardInput = input
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+
+            let requests: [[String: Any]] = [
+                [
+                    "id": "initialize",
+                    "method": "initialize",
+                    "params": [
+                        "clientInfo": [
+                            "name": "codex_dual_auth_launcher",
+                            "title": "Codex Dual Auth Launcher",
+                            "version": "0.1.3",
+                        ],
+                        "capabilities": ["experimentalApi": true],
+                    ],
+                ],
+                ["method": "initialized"],
+                [
+                    "id": "account",
+                    "method": "account/read",
+                    "params": ["refreshToken": false],
+                ],
+            ]
+            let requestData = try requests.reduce(into: Data()) { data, request in
+                data.append(try JSONSerialization.data(withJSONObject: request))
+                data.append(0x0A)
+            }
+            try input.fileHandleForWriting.write(contentsOf: requestData)
+
+            let decoder = JSONDecoder()
+            var responseBuffer = Data()
+            var receivedAccountResponse = false
+            var connectorAccount: ConnectorAccount?
+            readLoop: while process.isRunning {
+                let chunk = output.fileHandleForReading.availableData
+                if chunk.isEmpty { break }
+                responseBuffer.append(chunk)
+                while let newlineIndex = responseBuffer.firstIndex(of: 0x0A) {
+                    let line = responseBuffer[..<newlineIndex]
+                    responseBuffer.removeSubrange(...newlineIndex)
+                    guard let envelope = try? decoder.decode(
+                        AccountReadEnvelope.self,
+                        from: Data(line)
+                    ), envelope.id == "account" else { continue }
+                    receivedAccountResponse = true
+                    if let account = envelope.result?.account, account.type == "chatgpt" {
+                        connectorAccount = ConnectorAccount(
+                            email: account.email,
+                            planType: account.planType
+                        )
+                    }
+                    break readLoop
+                }
+            }
+            try? input.fileHandleForWriting.close()
+            if process.isRunning { process.terminate() }
+            process.waitUntilExit()
+            if receivedAccountResponse { return connectorAccount }
+            throw NSError(
+                domain: "CodexDualAuthLauncher",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "The connector account status response was incomplete."]
+            )
+        }.value
     }
 
     private func runConnectorCodex(arguments: [String]) async throws -> CommandResult {
@@ -191,22 +354,53 @@ struct ContentView: View {
             Label(model.statusText, systemImage: statusIcon)
                 .foregroundStyle(statusColor)
 
+            if let account = model.connectedAccount {
+                HStack(spacing: 12) {
+                    Image(systemName: "person.crop.circle.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.blue)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(account.displayName)
+                            .font(.headline)
+                            .textSelection(.enabled)
+                        if let plan = account.planDisplayName {
+                            Text(plan)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Image(systemName: "checkmark.seal.fill")
+                        .foregroundStyle(.green)
+                        .accessibilityLabel("Connected")
+                }
+                .padding(14)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+            }
+
             Text("Account A stays signed in through the official Codex app. This helper stores account B in a separate folder and routes only built-in Apps such as GitHub, Jira, Slack, and Vercel through it.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack {
-                Button("Sign In Connector Account") {
-                    Task { await model.signIn() }
+                if model.connectedAccount == nil {
+                    Button("Sign In Connector Account") {
+                        Task { await model.signIn() }
+                    }
+                    .disabled(model.isBusy)
+                } else {
+                    Button("Change Account…") {
+                        Task { await model.changeAccount() }
+                    }
+                    .disabled(model.isBusy)
                 }
-                .disabled(model.isBusy)
 
                 Button("Launch Codex") {
                     Task { await model.launchCodex() }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.connectedAccount == nil)
             }
 
             if !model.launchMessage.isEmpty {
@@ -225,7 +419,7 @@ struct ContentView: View {
             .font(.caption)
         }
         .padding(24)
-        .frame(width: 520, height: 390)
+        .frame(width: 520, height: 500)
         .task { await model.refreshStatus() }
     }
 

@@ -12,16 +12,16 @@ Prerequisites: Apple-silicon Mac running macOS 14 or later, with the official Co
 /bin/zsh -c "$(curl -fsSL https://raw.githubusercontent.com/Rana-Faraz/codex-dual-auth-launcher/main/install.sh)"
 ```
 
-The installer downloads the pinned `v0.1.2` release, checks its SHA-256 digest and code signature, installs it to `~/Applications/Codex Dual Auth.app`, and opens it. It does not modify the official Codex app.
+The installer downloads the pinned `v0.1.3` release, checks its SHA-256 digest and code signature, installs it to `~/Applications/Codex Dual Auth.app`, and opens it. It does not modify the official Codex app.
 
 Then:
 
 1. Quit Codex normally if it is running.
 2. Open **Codex Dual Auth** and click **Sign In Connector Account**.
 3. In the browser, sign in to ChatGPT account B—the account whose GitHub, Jira, Slack, Vercel, or other Apps are connected.
-4. Return to the launcher and click **Launch Codex**.
+4. Confirm the launcher shows account B's email and plan, then click **Launch Codex**.
 
-Use **Codex Dual Auth** whenever starting this isolated Apps profile. Starting Codex normally continues to use account A for both the model and Apps.
+Use **Change Account…** whenever you want to replace account B. Use **Codex Dual Auth** whenever starting this isolated Apps profile; the helper exits after Codex starts because it does not need to remain in the Dock or menu bar. Starting Codex normally continues to use account A for both the model and Apps.
 
 ## What is isolated
 
@@ -29,9 +29,9 @@ Use **Codex Dual Auth** whenever starting this isolated Apps profile. Starting C
 | --- | --- |
 | Threads, history, model requests, usage | Account A and the normal Codex home |
 | Built-in `codex_apps` discovery and tool calls | Account B |
-| Account B login and connector cache | `~/Library/Application Support/Codex Dual Auth/connector-account` |
+| Account B login, Apps directory, and installed-tool cache | `~/Library/Application Support/Codex Dual Auth/connector-account` |
 
-The app-server creates a second refresh-capable authentication manager and passes it only to the reserved `codex_apps` server. The normal model, thread, and usage paths retain account A. It fails closed when the connector profile is missing or is not a ChatGPT login.
+The app-server creates a second refresh-capable authentication manager and passes it only to the reserved `codex_apps` server. App discovery, installed state, source metadata, and connector calls all use the same account-B auth/cache context. This means the Apps page, `@` mentions, and source labels are derived from account B rather than leaking account A's connected state. The normal model, thread, and usage paths retain account A. It fails closed when the connector profile is missing or is not a ChatGPT login.
 
 OpenAI documents the underlying [Codex app-server protocol](https://developers.openai.com/codex/app-server/) and [Codex authentication storage](https://developers.openai.com/codex/auth/). The dual-auth behavior itself is an experiment, not an officially supported OpenAI feature.
 
@@ -56,7 +56,7 @@ cd codex-dual-auth-launcher
 
 The script fetches the pinned upstream Codex revision, applies [`patches/codex-dual-auth.patch`](patches/codex-dual-auth.patch), builds the Rust CLI, its matching `codex-code-mode-host`, and the SwiftUI launcher, strips symbols, ad-hoc signs the app, and writes the result to `dist/`. The host build uses OpenAI Codex's verified V8 artifact workflow.
 
-## Validation performed for v0.1.2
+## Validation performed for v0.1.3
 
 - `cargo check -p codex-mcp -p codex-core -p codex-app-server`
 - All 215 `codex-mcp` tests through the repository's `just test`/Nextest harness
@@ -64,6 +64,10 @@ The script fetches the pinned upstream Codex revision, applies [`patches/codex-d
 - Mach-O deployment-target regression check (`minos 14.0`)
 - Required matching `codex-code-mode-host` presence, architecture, and startup checks
 - Deep strict signature verification on the packaged app
+- Helper account identity read verified against the isolated account-B profile; the SwiftUI card displays its email and plan
+- `app/installed` force-refresh regression verified against independent account homes
+- Account A reported Vercel installed while account B did not; the dual-auth Apps response matched account B
+- Installed GitHub metadata resolved through `app/read` to the display name `GitHub`, rather than the internal `plugin-runtime` fallback
 - A live built-in GitHub tool call through the packaged code-mode host
 - A live desktop app-server turn with independent account A and account B profiles; GitHub returned account B's login
 
