@@ -12,7 +12,7 @@ Prerequisites: Apple-silicon Mac running macOS 14 or later, with the official Co
 /bin/zsh -c "$(curl -fsSL https://raw.githubusercontent.com/Rana-Faraz/codex-dual-auth-launcher/main/install.sh)"
 ```
 
-The installer downloads the pinned `v0.1.1` release, checks its SHA-256 digest and code signature, installs it to `~/Applications/Codex Dual Auth.app`, and opens it. It does not modify the official Codex app.
+The installer downloads the pinned `v0.1.2` release, checks its SHA-256 digest and code signature, installs it to `~/Applications/Codex Dual Auth.app`, and opens it. It does not modify the official Codex app.
 
 Then:
 
@@ -54,16 +54,18 @@ cd codex-dual-auth-launcher
 ./build-helper.sh
 ```
 
-The script fetches the pinned upstream Codex revision, applies [`patches/codex-dual-auth.patch`](patches/codex-dual-auth.patch), builds the Rust CLI and SwiftUI launcher, strips symbols, ad-hoc signs the app, and writes the result to `dist/`.
+The script fetches the pinned upstream Codex revision, applies [`patches/codex-dual-auth.patch`](patches/codex-dual-auth.patch), builds the Rust CLI, its matching `codex-code-mode-host`, and the SwiftUI launcher, strips symbols, ad-hoc signs the app, and writes the result to `dist/`. The host build uses OpenAI Codex's verified V8 artifact workflow.
 
-## Validation performed for v0.1.1
+## Validation performed for v0.1.2
 
 - `cargo check -p codex-mcp -p codex-core -p codex-app-server`
 - All 215 `codex-mcp` tests through the repository's `just test`/Nextest harness
 - Swift type-check and property-list validation
 - Mach-O deployment-target regression check (`minos 14.0`)
+- Required matching `codex-code-mode-host` presence, architecture, and startup checks
 - Deep strict signature verification on the packaged app
-- A live JSON-RPC `initialize` smoke test with independent account A and account B profiles; the app-server remained healthy and selected the isolated Apps identity
+- A live built-in GitHub tool call through the packaged code-mode host
+- A live desktop app-server turn with independent account A and account B profiles; GitHub returned account B's login
 
 The complete upstream Codex test suite was not run. The focused checks above cover the modified build boundary and connector routing, but this remains experimental software.
 

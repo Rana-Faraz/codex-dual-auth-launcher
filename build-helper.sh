@@ -22,6 +22,8 @@ git -C "$CODEX_SOURCE" apply "$SCRIPT_DIR/patches/codex-dual-auth.patch"
 
 cd "$CODEX_SOURCE/codex-rs"
 cargo build --release -p codex-cli --bin codex
+CODEX_REPO_ROOT="$CODEX_SOURCE" \
+  python3 "$SCRIPT_DIR/scripts/build-code-mode-host.py" "$CODEX_SOURCE"
 
 rm -rf "$APP_ROOT"
 mkdir -p "$APP_ROOT/Contents/MacOS" "$APP_ROOT/Contents/Resources"
@@ -35,8 +37,13 @@ swiftc \
   -o "$APP_ROOT/Contents/MacOS/CodexDualAuthLauncher"
 cp "$SCRIPT_DIR/Info.plist" "$APP_ROOT/Contents/Info.plist"
 cp "$CODEX_SOURCE/codex-rs/target/release/codex" "$APP_ROOT/Contents/Resources/codex-dual-auth"
-chmod 755 "$APP_ROOT/Contents/MacOS/CodexDualAuthLauncher" "$APP_ROOT/Contents/Resources/codex-dual-auth"
+cp "$CODEX_SOURCE/codex-rs/target/aarch64-apple-darwin/release/codex-code-mode-host" "$APP_ROOT/Contents/Resources/codex-code-mode-host"
+chmod 755 \
+  "$APP_ROOT/Contents/MacOS/CodexDualAuthLauncher" \
+  "$APP_ROOT/Contents/Resources/codex-dual-auth" \
+  "$APP_ROOT/Contents/Resources/codex-code-mode-host"
 strip -S -x "$APP_ROOT/Contents/Resources/codex-dual-auth"
+strip -S -x "$APP_ROOT/Contents/Resources/codex-code-mode-host"
 codesign --force --deep --sign - "$APP_ROOT"
 "$SCRIPT_DIR/scripts/verify-bundle.sh" "$APP_ROOT"
 
